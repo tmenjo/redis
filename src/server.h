@@ -1516,6 +1516,9 @@ void stopLoading(void);
 int rdbSaveRio(rio *rdb, int *error, int flags, rdbSaveInfo *rsi);
 
 /* AOF persistence */
+void openOrCreateAppendOnlyFile(void);
+int isOpenedAppendOnlyFile(void);
+void syncAppendOnlyFile(void);
 void flushAppendOnlyFile(int force);
 void feedAppendOnlyFile(struct redisCommand *cmd, int dictid, robj **argv, int argc);
 void aofRemoveTempFile(pid_t childpid);

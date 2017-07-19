@@ -1923,9 +1923,8 @@ void initServer(void) {
 
     /* Open the AOF file if needed. */
     if (server.aof_state == AOF_ON) {
-        server.aof_fd = open(server.aof_filename,
-                               O_WRONLY|O_APPEND|O_CREAT,0644);
-        if (server.aof_fd == -1) {
+        openOrCreateAppendOnlyFile();
+        if (!isOpenedAppendOnlyFile()) {
             serverLog(LL_WARNING, "Can't open the append-only file: %s",
                 strerror(errno));
             exit(1);
@@ -2543,7 +2542,7 @@ int prepareForShutdown(int flags) {
         /* Append only file: flush buffers and fsync() the AOF at exit */
         serverLog(LL_NOTICE,"Calling fsync() on the AOF file.");
         flushAppendOnlyFile(1);
-        aof_fsync(server.aof_fd);
+        syncAppendOnlyFile();
     }
 
     /* Create a new RDB file before exiting. */

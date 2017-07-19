@@ -43,6 +43,19 @@
 void aofUpdateCurrentSize(void);
 void aofClosePipes(void);
 
+enum aof_type {
+    AOF_TYPE_FILEPTR = 0,
+    AOF_TYPE_FD,
+};
+
+typedef struct aof_handler {
+    enum aof_type type;
+    union {
+        FILE *fp;
+        int fd;
+    } entity;
+} aof_handler;
+
 /* ----------------------------------------------------------------------------
  * AOF rewrite buffer implementation.
  *
@@ -171,7 +184,7 @@ void aofRewriteBufferAppend(unsigned char *s, unsigned long len) {
 /* Write the buffer (possibly composed of multiple blocks) into the specified
  * fd. If a short write or any other error happens -1 is returned,
  * otherwise the number of bytes written is returned. */
-ssize_t aofRewriteBufferWrite(int fd) {
+ssize_t aofRewriteBufferWriteFd(int fd) {
     listNode *ln;
     listIter li;
     ssize_t count = 0;
@@ -193,9 +206,128 @@ ssize_t aofRewriteBufferWrite(int fd) {
     return count;
 }
 
+ssize_t aofRewriteBufferWrite(aof_handler *h) {
+    switch (h->type) {
+    case AOF_TYPE_FILEPTR:
+        break; /* Unsupported. */
+    case AOF_TYPE_FD:
+        return aofRewriteBufferWriteFd(h->entity.fd);
+    }
+    /* Fallback; DO NOT come here.*/
+    return (ssize_t)(-1);
+}
+
 /* ----------------------------------------------------------------------------
  * AOF file implementation
  * ------------------------------------------------------------------------- */
+
+/* struct "aof_handler" and functions "aofhandlerFoobar" for temporary AOF */
+
+static inline void aofhandlerInit(aof_handler *h) {
+    h->type = AOF_TYPE_FILEPTR;
+    h->entity.fp = NULL;
+}
+
+/* Tries to create a new file for write. A returned handler will be FILE*. */
+static inline void aofhandlerCreate(aof_handler *h, const char *filename) {
+    aofhandlerInit(h);
+    h->type = AOF_TYPE_FILEPTR;
+    h->entity.fp = fopen(filename,"w");
+}
+
+/* Tries to open an existing file for append. A returned handler will be int. */
+static inline void aofhandlerOpenForAppend(aof_handler *h, const char *filename) {
+    aofhandlerInit(h);
+    h->type = AOF_TYPE_FD;
+    h->entity.fd = open(filename,O_WRONLY|O_APPEND);
+}
+
+/* Returns 1 if a given aof_handler is opened; 0 otherwise. */
+static inline int aofhandlerIsOpened(const aof_handler *h) {
+    switch (h->type) {
+        case AOF_TYPE_FILEPTR: return (h->entity.fp != NULL);
+        case AOF_TYPE_FD:      return (h->entity.fd != -1);
+    }
+    /* Fallback; DO NOT come here. */
+    return 0;
+}
+
+/* Tries to close a file handler.
+ * Retuens 0 if success; EOF otherwise. */
+static inline int aofhandlerClose(aof_handler *h) {
+    switch (h->type) {
+    case AOF_TYPE_FILEPTR:
+        return fclose(h->entity.fp);
+    case AOF_TYPE_FD:
+        return (close(h->entity.fd) == 0 ? 0 : EOF);
+    }
+    /* Fallback; DO NOT come here. */
+    errno = EBADF;
+    return EOF;
+}
+
+/* Tries to flush a file handler.
+ * Retuens 0 if success; EOF otherwise. */
+static inline int aofhandlerFlush(aof_handler *h) {
+    switch (h->type) {
+    case AOF_TYPE_FILEPTR: return fflush(h->entity.fp);
+    case AOF_TYPE_FD:      return 0;
+    }
+    /* Fallback; DO NOT come here. */
+    errno = EBADF;
+    return EOF;
+}
+
+/* Tries to sync a file handler.
+ * Retuens 0 if success; -1 otherwise. */
+static inline int aofhandlerSync(aof_handler *h) {
+    switch (h->type) {
+    case AOF_TYPE_FILEPTR: return fsync(fileno(h->entity.fp));
+    case AOF_TYPE_FD:      return fsync(h->entity.fd);
+    }
+    /* Fallback; DO NOT come here. */
+    errno = EBADF;
+    return -1;
+}
+
+/* Replace server.aof_{logpool,fd} with a given aof_handler "h".
+ * After a call, the "h" has the old server.aof_{logpool,fd}. */
+void aofhandlerSwap(aof_handler *h) {
+    switch (h->type) {
+    case AOF_TYPE_FILEPTR:
+        break; /* Unsupported; DO NOT come here. */
+    case AOF_TYPE_FD:
+        { /* Scope for oldfd. */
+            const int oldfd = server.aof_fd;
+            server.aof_fd = h->entity.fd;
+            h->entity.fd = oldfd;
+        }
+        break;
+    }
+}
+
+/* functions "foobarAppendOnlyFile" for server.aof_fd */
+
+void openOrCreateAppendOnlyFile(void) {
+    server.aof_fd = open(server.aof_filename,O_WRONLY|O_APPEND|O_CREAT,0644);
+}
+
+int isOpenedAppendOnlyFile(void) {
+    return (server.aof_fd != -1);
+}
+
+void syncAppendOnlyFile(void) {
+    aof_fsync(server.aof_fd);
+}
+
+static int statAppendOnlyFile(struct redis_stat *sb) {
+    return redis_fstat(server.aof_fd,sb);
+}
+
+static void closeAppendOnlyFile(void) {
+    close(server.aof_fd);
+    server.aof_fd = -1;
+}
 
 /* Starts a background task that performs fsync() against the specified
  * file descriptor (the one of the AOF file) in another thread. */
@@ -208,10 +340,9 @@ void aof_background_fsync(int fd) {
 void stopAppendOnly(void) {
     serverAssert(server.aof_state != AOF_OFF);
     flushAppendOnlyFile(1);
-    aof_fsync(server.aof_fd);
-    close(server.aof_fd);
+    syncAppendOnlyFile();
+    closeAppendOnlyFile();
 
-    server.aof_fd = -1;
     server.aof_selected_db = -1;
     server.aof_state = AOF_OFF;
     /* rewrite operation in progress? kill it, wait child exit */
@@ -239,9 +370,9 @@ int startAppendOnly(void) {
     char cwd[MAXPATHLEN]; /* Current working dir path for error messages. */
 
     server.aof_last_fsync = server.unixtime;
-    server.aof_fd = open(server.aof_filename,O_WRONLY|O_APPEND|O_CREAT,0644);
+    openOrCreateAppendOnlyFile();
     serverAssert(server.aof_state == AOF_OFF);
-    if (server.aof_fd == -1) {
+    if (!isOpenedAppendOnlyFile()) {
         char *cwdp = getcwd(cwd,MAXPATHLEN);
 
         serverLog(LL_WARNING,
@@ -256,7 +387,7 @@ int startAppendOnly(void) {
         server.aof_rewrite_scheduled = 1;
         serverLog(LL_WARNING,"AOF was enabled but there is already a child process saving an RDB file on disk. An AOF background was scheduled to start when possible.");
     } else if (rewriteAppendOnlyFileBackground() == C_ERR) {
-        close(server.aof_fd);
+        closeAppendOnlyFile();
         serverLog(LL_WARNING,"Redis needs to enable the AOF but can't trigger a background AOF rewrite operation. Check the above logs for more info about the error.");
         return C_ERR;
     }
@@ -436,7 +567,7 @@ void flushAppendOnlyFile(int force) {
         /* aof_fsync is defined as fdatasync() for Linux in order to avoid
          * flushing metadata. */
         latencyStartMonitor(latency);
-        aof_fsync(server.aof_fd); /* Let's try to get this data on the disk */
+        syncAppendOnlyFile(); /* Let's try to get this data on the disk */
         latencyEndMonitor(latency);
         latencyAddSampleIfNeeded("aof-fsync-always",latency);
         server.aof_last_fsync = server.unixtime;
@@ -629,11 +760,13 @@ void freeFakeClient(struct client *c) {
  * fatal error an error message is logged and the program exists. */
 int loadAppendOnlyFile(char *filename) {
     struct client *fakeClient;
-    FILE *fp = fopen(filename,"r");
+    FILE *fp = NULL;
     struct redis_stat sb;
     int old_aof_state = server.aof_state;
     long loops = 0;
     off_t valid_up_to = 0; /* Offset of latest well-formed command loaded. */
+
+    fp = fopen(filename,"r");
 
     if (fp == NULL) {
         serverLog(LL_WARNING,"Fatal error: can't open the append log file for reading: %s",strerror(errno));
@@ -1148,21 +1281,21 @@ werr:
  * are inserted using a single command. */
 int rewriteAppendOnlyFile(char *filename) {
     rio aof;
-    FILE *fp;
+    aof_handler h;
     char tmpfile[256];
     char byte;
 
     /* Note that we have to use a different temp name here compared to the
      * one used by rewriteAppendOnlyFileBackground() function. */
     snprintf(tmpfile,256,"temp-rewriteaof-%d.aof", (int) getpid());
-    fp = fopen(tmpfile,"w");
-    if (!fp) {
+    aofhandlerCreate(&h,tmpfile);
+    if (!aofhandlerIsOpened(&h)) {
         serverLog(LL_WARNING, "Opening the temp file for AOF rewrite in rewriteAppendOnlyFile(): %s", strerror(errno));
         return C_ERR;
     }
 
     server.aof_child_diff = sdsempty();
-    rioInitWithFile(&aof,fp);
+    rioInitWithFile(&aof,h.entity.fp);
 
     if (server.aof_rewrite_incremental_fsync)
         rioSetAutoSync(&aof,AOF_AUTOSYNC_BYTES);
@@ -1179,8 +1312,8 @@ int rewriteAppendOnlyFile(char *filename) {
 
     /* Do an initial slow fsync here while the parent is still sending
      * data, in order to make the next final fsync faster. */
-    if (fflush(fp) == EOF) goto werr;
-    if (fsync(fileno(fp)) == -1) goto werr;
+    if (aofhandlerFlush(&h) == EOF) goto werr;
+    if (aofhandlerSync(&h) == -1) goto werr;
 
     /* Read again a few times to get more data from the parent.
      * We can't read forever (the server may receive data from clients
@@ -1223,9 +1356,9 @@ int rewriteAppendOnlyFile(char *filename) {
         goto werr;
 
     /* Make sure data will not remain on the OS's output buffers */
-    if (fflush(fp) == EOF) goto werr;
-    if (fsync(fileno(fp)) == -1) goto werr;
-    if (fclose(fp) == EOF) goto werr;
+    if (aofhandlerFlush(&h) == EOF) goto werr;
+    if (aofhandlerSync(&h) == -1) goto werr;
+    if (aofhandlerClose(&h) == EOF) goto werr;
 
     /* Use RENAME to make sure the DB file is changed atomically only
      * if the generate DB file is ok. */
@@ -1239,7 +1372,7 @@ int rewriteAppendOnlyFile(char *filename) {
 
 werr:
     serverLog(LL_WARNING,"Write error writing append only file on disk: %s", strerror(errno));
-    fclose(fp);
+    aofhandlerClose(&h);
     unlink(tmpfile);
     return C_ERR;
 }
@@ -1423,7 +1556,7 @@ void aofUpdateCurrentSize(void) {
     mstime_t latency;
 
     latencyStartMonitor(latency);
-    if (redis_fstat(server.aof_fd,&sb) == -1) {
+    if (statAppendOnlyFile(&sb) == -1) {
         serverLog(LL_WARNING,"Unable to obtain the AOF file length. stat: %s",
             strerror(errno));
     } else {
@@ -1437,7 +1570,8 @@ void aofUpdateCurrentSize(void) {
  * Handle this. */
 void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
     if (!bysignal && exitcode == 0) {
-        int newfd, oldfd;
+        aof_handler newaof;
+        int oldfd;
         char tmpfile[256];
         long long now = ustime();
         mstime_t latency;
@@ -1450,17 +1584,17 @@ void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
         latencyStartMonitor(latency);
         snprintf(tmpfile,256,"temp-rewriteaof-bg-%d.aof",
             (int)server.aof_child_pid);
-        newfd = open(tmpfile,O_WRONLY|O_APPEND);
-        if (newfd == -1) {
+        aofhandlerOpenForAppend(&newaof,tmpfile);
+        if (!aofhandlerIsOpened(&newaof)) {
             serverLog(LL_WARNING,
                 "Unable to open the temporary AOF produced by the child: %s", strerror(errno));
             goto cleanup;
         }
 
-        if (aofRewriteBufferWrite(newfd) == -1) {
+        if (aofRewriteBufferWrite(&newaof) == -1) {
             serverLog(LL_WARNING,
                 "Error trying to flush the parent diff to the rewritten AOF: %s", strerror(errno));
-            close(newfd);
+            aofhandlerClose(&newaof);
             goto cleanup;
         }
         latencyEndMonitor(latency);
@@ -1496,7 +1630,7 @@ void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
          * guarantee atomicity for this switch has already happened by then, so
          * we don't care what the outcome or duration of that close operation
          * is, as long as the file descriptor is released again. */
-        if (server.aof_fd == -1) {
+        if (!isOpenedAppendOnlyFile()) {
             /* AOF disabled */
 
              /* Don't care if this fails: oldfd will be -1 and we handle that.
@@ -1517,25 +1651,25 @@ void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
                 tmpfile,
                 server.aof_filename,
                 strerror(errno));
-            close(newfd);
+            aofhandlerClose(&newaof);
             if (oldfd != -1) close(oldfd);
             goto cleanup;
         }
         latencyEndMonitor(latency);
         latencyAddSampleIfNeeded("aof-rename",latency);
 
-        if (server.aof_fd == -1) {
+        if (!isOpenedAppendOnlyFile()) {
             /* AOF disabled, we don't need to set the AOF file descriptor
              * to this new file, so we can close it. */
-            close(newfd);
+            aofhandlerClose(&newaof);
         } else {
-            /* AOF enabled, replace the old fd with the new one. */
-            oldfd = server.aof_fd;
-            server.aof_fd = newfd;
+            /* AOF enabled, replace the old handler with the new one. */
+            aofhandlerSwap(&newaof);
+            oldfd = newaof.entity.fd;
             if (server.aof_fsync == AOF_FSYNC_ALWAYS)
-                aof_fsync(newfd);
+                syncAppendOnlyFile();
             else if (server.aof_fsync == AOF_FSYNC_EVERYSEC)
-                aof_background_fsync(newfd);
+                aof_background_fsync(server.aof_fd);
             server.aof_selected_db = -1; /* Make sure SELECT is re-issued */
             aofUpdateCurrentSize();
             server.aof_rewrite_base_size = server.aof_current_size;
