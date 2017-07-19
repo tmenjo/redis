@@ -34,6 +34,9 @@
 
 #include <stdio.h>
 #include <stdint.h>
+#ifdef USE_NVML
+#include <libpmemlog.h>
+#endif
 #include "sds.h"
 
 struct _rio {
@@ -81,6 +84,14 @@ struct _rio {
             off_t pos;
             sds buf;
         } fdset;
+#ifdef USE_NVML
+        /* Libpmemlog target. */
+        struct {
+            PMEMlogpool *logpool;
+            size_t bulkappend; /* bulk-append bytes; 0 means non-bulk. */
+            sds buf;
+        } pmemlog;
+#endif
     } io;
 };
 
@@ -127,8 +138,14 @@ static inline int rioFlush(rio *r) {
 void rioInitWithFile(rio *r, FILE *fp);
 void rioInitWithBuffer(rio *r, sds s);
 void rioInitWithFdset(rio *r, int *fds, int numfds);
+#ifdef USE_NVML
+void rioInitWithPmemlog(rio *r, PMEMlogpool *logpool);
+#endif
 
 void rioFreeFdset(rio *r);
+#ifdef USE_NVML
+void rioFreePmemlog(rio *r);
+#endif
 
 size_t rioWriteBulkCount(rio *r, char prefix, int count);
 size_t rioWriteBulkString(rio *r, const char *buf, size_t len);
@@ -140,5 +157,8 @@ int rioWriteBulkObject(rio *r, struct redisObject *obj);
 
 void rioGenericUpdateChecksum(rio *r, const void *buf, size_t len);
 void rioSetAutoSync(rio *r, off_t bytes);
+#ifdef USE_NVML
+void rioSetBulkAppend(rio *r, size_t bytes);
+#endif
 
 #endif

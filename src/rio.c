@@ -49,6 +49,9 @@
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
+#ifdef USE_NVML
+#include <libpmemlog.h>
+#endif
 #include "rio.h"
 #include "util.h"
 #include "crc64.h"
@@ -282,6 +285,73 @@ void rioFreeFdset(rio *r) {
     zfree(r->io.fdset.state);
     sdsfree(r->io.fdset.buf);
 }
+
+#ifdef USE_NVML
+/* ------------------------- libpmemlog implementation ----------------------- */
+static int rioPmemlogFlush(rio *r);
+
+static size_t rioPmemlogRead(rio *r, void *buf, size_t len) {
+    UNUSED(r);
+    UNUSED(buf);
+    UNUSED(len);
+    return 0; /* Always failure (unsupported). */
+}
+
+static size_t rioPmemlogWrite(rio *r, const void *buf, size_t len) {
+    if (r->io.pmemlog.bulkappend == 0) {
+        return (size_t)(pmemlog_append(r->io.pmemlog.logpool,buf,len) == 0);
+    }
+
+    r->io.pmemlog.buf = sdscatlen(r->io.pmemlog.buf,buf,len);
+    return (sdslen(r->io.pmemlog.buf) < r->io.pmemlog.bulkappend) ? 1
+         : (size_t)rioPmemlogFlush(r);
+}
+
+static off_t rioPmemlogTell(rio *r) {
+    off_t buflen = (off_t)(r->io.pmemlog.buf ? sdslen(r->io.pmemlog.buf) : 0);
+    return (off_t)pmemlog_tell(r->io.pmemlog.logpool) + buflen;
+}
+
+static int rioPmemlogFlush(rio *r) {
+    if (r->io.pmemlog.bulkappend == 0) return 1;
+
+    size_t len = sdslen(r->io.pmemlog.buf);
+    if (len == 0) return 1;
+    if (pmemlog_append(r->io.pmemlog.logpool,r->io.pmemlog.buf,len) != 0) return 0;
+
+    sdsclear(r->io.pmemlog.buf);
+    return 1;
+}
+
+static const rio rioPmemlogIO = {
+    rioPmemlogRead,
+    rioPmemlogWrite,
+    rioPmemlogTell,
+    rioPmemlogFlush,
+    NULL,           /* update_checksum */
+    0,              /* current checksum */
+    0,              /* bytes read or written */
+    0,              /* read/write chunk size */
+    { { NULL, 0 } } /* union for io-specific vars */
+};
+
+void rioInitWithPmemlog(rio *r, PMEMlogpool *logpool) {
+    *r = rioPmemlogIO;
+    r->io.pmemlog.logpool = logpool;
+    r->io.pmemlog.bulkappend = 0;
+    r->io.pmemlog.buf = NULL;
+}
+
+void rioSetBulkAppend(rio *r, size_t bytes) {
+    serverAssert(r->read == rioPmemlogIO.read);
+    r->io.pmemlog.bulkappend = bytes;
+    r->io.pmemlog.buf = sdsempty();
+}
+
+void rioFreePmemlog(rio *r) {
+    sdsfree(r->io.pmemlog.buf);
+}
+#endif /* USE_NVML */
 
 /* ---------------------------- Generic functions ---------------------------- */
 

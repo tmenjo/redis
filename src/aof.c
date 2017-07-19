@@ -39,6 +39,10 @@
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <sys/param.h>
+#ifdef USE_NVML
+#include <libpmemlog.h>
+#include <sys/syscall.h>
+#endif
 
 void aofUpdateCurrentSize(void);
 void aofClosePipes(void);
@@ -46,6 +50,9 @@ void aofClosePipes(void);
 enum aof_type {
     AOF_TYPE_FILEPTR = 0,
     AOF_TYPE_FD,
+#ifdef USE_NVML
+    AOF_TYPE_PMEMLOG,
+#endif
 };
 
 typedef struct aof_handler {
@@ -53,6 +60,9 @@ typedef struct aof_handler {
     union {
         FILE *fp;
         int fd;
+#ifdef USE_NVML
+        PMEMlogpool *logpool;
+#endif
     } entity;
 } aof_handler;
 
@@ -206,12 +216,38 @@ ssize_t aofRewriteBufferWriteFd(int fd) {
     return count;
 }
 
+#ifdef USE_NVML
+ssize_t aofRewriteBufferWritePmemlog(PMEMlogpool *logpool) {
+    listNode *ln;
+    listIter li;
+    ssize_t count = 0;
+
+    listRewind(server.aof_rewrite_buf_blocks,&li);
+    while((ln = listNext(&li))) {
+        aofrwblock *block = listNodeValue(ln);
+
+        if (block->used) {
+            if (pmemlog_append(logpool,block->buf,block->used) == -1) {
+                errno = EIO;
+                return -1;
+            }
+            count += block->used;
+        }
+    }
+    return count;
+}
+#endif /* #ifdef USE_NVML */
+
 ssize_t aofRewriteBufferWrite(aof_handler *h) {
     switch (h->type) {
     case AOF_TYPE_FILEPTR:
         break; /* Unsupported. */
     case AOF_TYPE_FD:
         return aofRewriteBufferWriteFd(h->entity.fd);
+#ifdef USE_NVML
+    case AOF_TYPE_PMEMLOG:
+        return aofRewriteBufferWritePmemlog(h->entity.logpool);
+#endif
     }
     /* Fallback; DO NOT come here.*/
     return (ssize_t)(-1);
@@ -223,21 +259,52 @@ ssize_t aofRewriteBufferWrite(aof_handler *h) {
 
 /* struct "aof_handler" and functions "aofhandlerFoobar" for temporary AOF */
 
+#ifdef USE_NVML
+/* Check whether the AOF is a plain file (filedes) or a PMEMlogpool file.
+ * FIXME Give a better function name. */
+static int aofhandlerIsPmemlog(const char *filename) {
+    PMEMlogpool *const logpool = pmemlog_open(filename);
+    if (logpool == NULL) return 0;
+    pmemlog_close(logpool);
+    return 1;
+}
+#endif
+
 static inline void aofhandlerInit(aof_handler *h) {
     h->type = AOF_TYPE_FILEPTR;
     h->entity.fp = NULL;
 }
 
-/* Tries to create a new file for write. A returned handler will be FILE*. */
+/* Tries to create a new file for write. A returned handler will be either
+ * PMEMlogpool* or FILE*, depending on the current server.aof_{logpool,fd}. */
 static inline void aofhandlerCreate(aof_handler *h, const char *filename) {
     aofhandlerInit(h);
+#ifdef USE_NVML
+    if (server.aof_logpool != NULL) {
+        /* I know the size of PMEMLOG file header is 8192 bytes. See also
+         * NVML's src/libpmemlog/log.h: struct pmemlog, LOG_FORMAT_DATA_ALIGN
+         * and src/common/pool_hdr.h: struct pool_hdr. */
+        const size_t size = pmemlog_nbyte(server.aof_logpool) + 8192;
+        h->type = AOF_TYPE_PMEMLOG;
+        h->entity.logpool = pmemlog_create(filename,size,0644);
+        return;
+    }
+#endif
     h->type = AOF_TYPE_FILEPTR;
     h->entity.fp = fopen(filename,"w");
 }
 
-/* Tries to open an existing file for append. A returned handler will be int. */
+/* Tries to open an existing file for append. A returned handler will be either
+ * PMEMlogpool* or int, depending on the current server.aof_{logpool,fd}. */
 static inline void aofhandlerOpenForAppend(aof_handler *h, const char *filename) {
     aofhandlerInit(h);
+#ifdef USE_NVML
+    if (server.aof_logpool != NULL) {
+        h->type = AOF_TYPE_PMEMLOG;
+        h->entity.logpool = pmemlog_open(filename);
+        return;
+    }
+#endif
     h->type = AOF_TYPE_FD;
     h->entity.fd = open(filename,O_WRONLY|O_APPEND);
 }
@@ -247,6 +314,9 @@ static inline int aofhandlerIsOpened(const aof_handler *h) {
     switch (h->type) {
         case AOF_TYPE_FILEPTR: return (h->entity.fp != NULL);
         case AOF_TYPE_FD:      return (h->entity.fd != -1);
+#ifdef USE_NVML
+        case AOF_TYPE_PMEMLOG: return (h->entity.logpool != NULL);
+#endif
     }
     /* Fallback; DO NOT come here. */
     return 0;
@@ -260,6 +330,17 @@ static inline int aofhandlerClose(aof_handler *h) {
         return fclose(h->entity.fp);
     case AOF_TYPE_FD:
         return (close(h->entity.fd) == 0 ? 0 : EOF);
+#ifdef USE_NVML
+    case AOF_TYPE_PMEMLOG:
+        { /* Scope for oe. */
+            const int oe = errno; /* Save the original errno. */
+            errno = 0;
+            pmemlog_close(h->entity.logpool); /* This may set the errno. */
+            if (errno != 0) return EOF;
+            errno = oe; /* Restore the original errno. */
+        }
+        return 0;
+#endif
     }
     /* Fallback; DO NOT come here. */
     errno = EBADF;
@@ -272,6 +353,9 @@ static inline int aofhandlerFlush(aof_handler *h) {
     switch (h->type) {
     case AOF_TYPE_FILEPTR: return fflush(h->entity.fp);
     case AOF_TYPE_FD:      return 0;
+#ifdef USE_NVML
+    case AOF_TYPE_PMEMLOG: return 0;
+#endif
     }
     /* Fallback; DO NOT come here. */
     errno = EBADF;
@@ -284,6 +368,9 @@ static inline int aofhandlerSync(aof_handler *h) {
     switch (h->type) {
     case AOF_TYPE_FILEPTR: return fsync(fileno(h->entity.fp));
     case AOF_TYPE_FD:      return fsync(h->entity.fd);
+#ifdef USE_NVML
+    case AOF_TYPE_PMEMLOG: return 0;
+#endif
     }
     /* Fallback; DO NOT come here. */
     errno = EBADF;
@@ -303,28 +390,67 @@ void aofhandlerSwap(aof_handler *h) {
             h->entity.fd = oldfd;
         }
         break;
+#ifdef USE_NVML
+    case AOF_TYPE_PMEMLOG:
+        { /* scope for oldlogpool. */
+            PMEMlogpool *const oldlogpool = server.aof_logpool;
+            server.aof_logpool = h->entity.logpool;
+            h->entity.logpool = oldlogpool;
+        }
+        break;
+#endif
     }
 }
 
-/* functions "foobarAppendOnlyFile" for server.aof_fd */
+/* functions "foobarAppendOnlyFile" for server.{aof_fd,aof_logpool} */
 
 void openOrCreateAppendOnlyFile(void) {
+#ifdef USE_NVML
+    if (aofhandlerIsPmemlog(server.aof_filename)) {
+        server.aof_logpool = pmemlog_open(server.aof_filename);
+        return;
+    }
+#endif
     server.aof_fd = open(server.aof_filename,O_WRONLY|O_APPEND|O_CREAT,0644);
 }
 
 int isOpenedAppendOnlyFile(void) {
+#ifdef USE_NVML
+    serverAssert(server.aof_logpool == NULL || server.aof_fd == -1);
+    return (server.aof_logpool != NULL || server.aof_fd != -1);
+#else
     return (server.aof_fd != -1);
+#endif
 }
 
 void syncAppendOnlyFile(void) {
+#ifdef USE_NVML
+    serverAssert(server.aof_logpool == NULL || server.aof_fd == -1);
+    if (server.aof_logpool != NULL) return;
+#endif
     aof_fsync(server.aof_fd);
 }
 
 static int statAppendOnlyFile(struct redis_stat *sb) {
+#ifdef USE_NVML
+    serverAssert(server.aof_logpool == NULL || server.aof_fd == -1);
+    if (server.aof_logpool != NULL) {
+        sb->st_size = (off_t)pmemlog_tell(server.aof_logpool);
+        return 0; /* success */
+    }
+#endif
     return redis_fstat(server.aof_fd,sb);
 }
 
 static void closeAppendOnlyFile(void) {
+#ifdef USE_NVML
+    serverAssert(server.aof_logpool == NULL || server.aof_fd == -1);
+    if (server.aof_logpool != NULL) {
+        pmemlog_close(server.aof_logpool);
+        server.aof_logpool = NULL;
+        return;
+    }
+#endif
     close(server.aof_fd);
     server.aof_fd = -1;
 }
@@ -454,7 +580,17 @@ void flushAppendOnlyFile(int force) {
      * or alike */
 
     latencyStartMonitor(latency);
+#ifdef USE_NVML
+    if (server.aof_logpool != NULL) {
+        const size_t n = sdslen(server.aof_buf);
+        const int r = pmemlog_append(server.aof_logpool,server.aof_buf,n);
+        nwritten = (r == -1) ? -1 : (ssize_t)n;
+    } else {
+        nwritten = write(server.aof_fd,server.aof_buf,sdslen(server.aof_buf));
+    }
+#else
     nwritten = write(server.aof_fd,server.aof_buf,sdslen(server.aof_buf));
+#endif
     latencyEndMonitor(latency);
     /* We want to capture different events for delayed writes:
      * when the delay happens with a pending fsync, or with a saving child
@@ -491,6 +627,8 @@ void flushAppendOnlyFile(int force) {
                 server.aof_last_write_errno = errno;
             }
         } else {
+            /* Note that if AOF is a libpmemlog file, this else block is
+             * unreachable because no short write can occur. */
             if (can_log) {
                 serverLog(LL_WARNING,"Short write while writing to "
                                        "the AOF file: (nwritten=%lld, "
@@ -573,7 +711,7 @@ void flushAppendOnlyFile(int force) {
         server.aof_last_fsync = server.unixtime;
     } else if ((server.aof_fsync == AOF_FSYNC_EVERYSEC &&
                 server.unixtime > server.aof_last_fsync)) {
-        if (!sync_in_progress) aof_background_fsync(server.aof_fd);
+        if (!sync_in_progress && server.aof_fd != -1) aof_background_fsync(server.aof_fd);
         server.aof_last_fsync = server.unixtime;
     }
 }
@@ -755,6 +893,26 @@ void freeFakeClient(struct client *c) {
     zfree(c);
 }
 
+#ifdef USE_NVML
+/* Assume that pmemlog_walk() is called with len=0. Then the len of this
+ * function becomes the available length of the pmemlog file in bytes.
+ * Here "return 0" means "terminate the walk", so always return 0. */
+static int walkCallback(const void *buf, size_t len, void *arg) {
+    serverAssert(len <= (size_t)SSIZE_MAX);
+
+    const int fd = *(int *)arg;
+    const char *const cbuf = (const char *)buf;
+    ssize_t written = -1;
+
+    for (size_t off = 0; off < len; off += (size_t)written) {
+        written = write(fd,&cbuf[off],len-off);
+        if (written == -1) return 0;
+    }
+
+    return 0;
+}
+#endif /* #ifdef USE_NVML */
+
 /* Replay the append log file. On success C_OK is returned. On non fatal
  * error (the append only file is zero-length) C_ERR is returned. On
  * fatal error an error message is logged and the program exists. */
@@ -766,7 +924,37 @@ int loadAppendOnlyFile(char *filename) {
     long loops = 0;
     off_t valid_up_to = 0; /* Offset of latest well-formed command loaded. */
 
+#ifdef USE_NVML
+    serverAssert(server.aof_logpool == NULL || server.aof_fd == -1);
+
+    if (server.aof_logpool != NULL) {
+        /* Note that it is hard to load PMEMLOG AOF via libpmemlog API.
+         * Instead, copy PMEMLOG AOF content to on-memory filedes then
+         * wrap it up in FILE* to utilize existing code for FILE*. */
+
+        int memfd = (int)syscall(SYS_memfd_create, "temp_aof", 0);
+        if (memfd == -1) {
+            serverLog(LL_WARNING,"memfd_create failed: %s",strerror(errno));
+            exit(1);
+        }
+
+        pmemlog_walk(server.aof_logpool,0,walkCallback,&memfd);
+        if (errno != 0) {
+            serverLog(LL_WARNING,"pmemlog_walk failed: %s",strerror(errno));
+            exit(1);
+        }
+
+        if (lseek(memfd,0,SEEK_SET) != 0) {
+            serverLog(LL_WARNING,"lseek failed: %s",strerror(errno));
+            exit(1);
+        }
+        fp = fdopen(memfd,"r");
+    } else {
+        fp = fopen(filename,"r");
+    }
+#else
     fp = fopen(filename,"r");
+#endif /* #ifdef USE_NVML */
 
     if (fp == NULL) {
         serverLog(LL_WARNING,"Fatal error: can't open the append log file for reading: %s",strerror(errno));
@@ -1295,10 +1483,20 @@ int rewriteAppendOnlyFile(char *filename) {
     }
 
     server.aof_child_diff = sdsempty();
+#ifdef USE_NVML
+    if (h.type == AOF_TYPE_PMEMLOG) rioInitWithPmemlog(&aof,h.entity.logpool);
+    else rioInitWithFile(&aof,h.entity.fp);
+
+    if (server.aof_rewrite_incremental_fsync) {
+        if (h.type == AOF_TYPE_PMEMLOG) rioSetBulkAppend(&aof,AOF_AUTOSYNC_BYTES);
+        else rioSetAutoSync(&aof,AOF_AUTOSYNC_BYTES);
+    }
+#else
     rioInitWithFile(&aof,h.entity.fp);
 
     if (server.aof_rewrite_incremental_fsync)
         rioSetAutoSync(&aof,AOF_AUTOSYNC_BYTES);
+#endif
 
     if (server.aof_use_rdb_preamble) {
         int error;
@@ -1354,6 +1552,13 @@ int rewriteAppendOnlyFile(char *filename) {
         (double) sdslen(server.aof_child_diff) / (1024*1024));
     if (rioWrite(&aof,server.aof_child_diff,sdslen(server.aof_child_diff)) == 0)
         goto werr;
+#ifdef USE_NVML
+    /* Flush internal buffer and free it in a case of pmemlog bulk-append. */
+    if (h.type == AOF_TYPE_PMEMLOG && server.aof_rewrite_incremental_fsync) {
+        if (rioFlush(&aof) == 0) goto werr;
+        rioFreePmemlog(&aof);
+    }
+#endif
 
     /* Make sure data will not remain on the OS's output buffers */
     if (aofhandlerFlush(&h) == EOF) goto werr;
@@ -1572,6 +1777,9 @@ void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
     if (!bysignal && exitcode == 0) {
         aof_handler newaof;
         int oldfd;
+#ifdef USE_NVML
+        PMEMlogpool *oldlogpool = NULL;
+#endif
         char tmpfile[256];
         long long now = ustime();
         mstime_t latency;
@@ -1665,10 +1873,13 @@ void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
         } else {
             /* AOF enabled, replace the old handler with the new one. */
             aofhandlerSwap(&newaof);
-            oldfd = newaof.entity.fd;
+            if (newaof.type == AOF_TYPE_FD) oldfd = newaof.entity.fd;
+#ifdef USE_NVML
+            if (newaof.type == AOF_TYPE_PMEMLOG) oldlogpool = newaof.entity.logpool;
+#endif
             if (server.aof_fsync == AOF_FSYNC_ALWAYS)
                 syncAppendOnlyFile();
-            else if (server.aof_fsync == AOF_FSYNC_EVERYSEC)
+            else if (server.aof_fsync == AOF_FSYNC_EVERYSEC && server.aof_fd != -1)
                 aof_background_fsync(server.aof_fd);
             server.aof_selected_db = -1; /* Make sure SELECT is re-issued */
             aofUpdateCurrentSize();
@@ -1683,12 +1894,26 @@ void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
         server.aof_lastbgrewrite_status = C_OK;
 
         serverLog(LL_NOTICE, "Background AOF rewrite finished successfully");
+#ifdef USE_NVML
+        /* A pmemlog file is posix_fallocate()-ed on the filesystem, so it
+         * can be difficult for admins to determine how many bytes written
+         * in the AOF. That's why the code below is. */
+        if (newaof.type == AOF_TYPE_PMEMLOG) {
+            struct redis_stat sb = {0};
+            statAppendOnlyFile(&sb);
+            serverLog(LL_NOTICE,"Effective size of the new AOF is %.2f MB",(double)sb.st_size/(1024*1024));
+        }
+#endif
         /* Change state from WAIT_REWRITE to ON if needed */
         if (server.aof_state == AOF_WAIT_REWRITE)
             server.aof_state = AOF_ON;
 
         /* Asynchronously close the overwritten AOF. */
         if (oldfd != -1) bioCreateBackgroundJob(BIO_CLOSE_FILE,(void*)(long)oldfd,NULL,NULL);
+#ifdef USE_NVML
+        /* FIXME Does this need to run asynchronously? */
+        if (oldlogpool != NULL) pmemlog_close(oldlogpool);
+#endif
 
         serverLog(LL_VERBOSE,
             "Background AOF rewrite signal handler took %lldus", ustime()-now);

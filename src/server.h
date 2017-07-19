@@ -48,6 +48,9 @@
 #include <netinet/in.h>
 #include <lua.h>
 #include <signal.h>
+#ifdef USE_NVML
+#include <libpmemlog.h>
+#endif
 
 typedef long long mstime_t; /* millisecond time type. */
 
@@ -999,6 +1002,9 @@ struct redisServer {
     list *aof_rewrite_buf_blocks;   /* Hold changes during an AOF rewrite. */
     sds aof_buf;      /* AOF buffer, written before entering the event loop */
     int aof_fd;       /* File descriptor of currently selected AOF file */
+#ifdef USE_NVML
+    PMEMlogpool *aof_logpool;
+#endif
     int aof_selected_db; /* Currently selected DB in AOF */
     time_t aof_flush_postponed_start; /* UNIX time of postponed AOF flush */
     time_t aof_last_fsync;            /* UNIX time of last fsync() */

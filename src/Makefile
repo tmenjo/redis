@@ -125,6 +125,11 @@ ifeq ($(MALLOC),jemalloc)
 	FINAL_LIBS+= ../deps/jemalloc/lib/libjemalloc.a
 endif
 
+ifeq ($(USE_NVML),yes)
+	FINAL_CFLAGS+= -DUSE_NVML
+	FINAL_LIBS+= -lpmemlog -lpmem
+endif
+
 REDIS_CC=$(QUIET_CC)$(CC) $(FINAL_CFLAGS)
 REDIS_LD=$(QUIET_LINK)$(CC) $(FINAL_LDFLAGS)
 REDIS_INSTALL=$(QUIET_INSTALL)$(INSTALL)
