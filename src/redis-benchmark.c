@@ -69,6 +69,7 @@ static struct config {
     long long start;
     long long totlatency;
     long long *latency;
+    int percentile;
     const char *title;
     list *clients;
     int quiet;
@@ -428,6 +429,19 @@ static int compareLatency(const void *a, const void *b) {
     return (*(long long*)a)-(*(long long*)b);
 }
 
+static void showLatencyPercentile(unsigned int from, unsigned int step) {
+    unsigned int perc;
+    long long curlat;
+
+    assert(from < 100 && step < 100 && step != 0 && (100-from)%step == 0);
+
+    /* note that config.latency should be sorted in ascending order */
+    for (perc = from; perc < 100; perc+=step) {
+        curlat = config.latency[config.requests/100*perc];
+        printf("%u%% <= %lld microseconds\n", perc, curlat);
+    }
+}
+
 static void showLatencyReport(void) {
     int i, curlat = 0;
     float perc, reqpersec;
@@ -443,11 +457,18 @@ static void showLatencyReport(void) {
         printf("\n");
 
         qsort(config.latency,config.requests,sizeof(long long),compareLatency);
-        for (i = 0; i < config.requests; i++) {
-            if (config.latency[i]/1000 != curlat || i == (config.requests-1)) {
-                curlat = config.latency[i]/1000;
-                perc = ((float)(i+1)*100)/config.requests;
-                printf("%.2f%% <= %d milliseconds\n", perc, curlat);
+        if (config.percentile) {
+            printf("0%% <= %lld microseconds\n", config.latency[0]);
+            showLatencyPercentile(10, 10);
+            showLatencyPercentile(91,  1);
+            printf("100%% <= %lld microseconds\n", config.latency[config.requests-1]);
+        } else {
+            for (i = 0; i < config.requests; i++) {
+                if (config.latency[i]/1000 != curlat || i == (config.requests-1)) {
+                    curlat = config.latency[i]/1000;
+                    perc = ((float)(i+1)*100)/config.requests;
+                    printf("%.2f%% <= %d milliseconds\n", perc, curlat);
+                }
             }
         }
         printf("%.2f requests per second\n\n", reqpersec);
@@ -525,6 +546,8 @@ int parseOptions(int argc, const char **argv) {
             config.quiet = 1;
         } else if (!strcmp(argv[i],"--csv")) {
             config.csv = 1;
+        } else if (!strcmp(argv[i],"--percentile")) {
+            config.percentile = 1;
         } else if (!strcmp(argv[i],"-l")) {
             config.loop = 1;
         } else if (!strcmp(argv[i],"-I")) {
@@ -586,6 +609,7 @@ usage:
 "                    (no more than 1 error per second is displayed)\n"
 " -q                 Quiet. Just show query/sec values\n"
 " --csv              Output in CSV format\n"
+" --percentile       Output latency in percentile\n"
 " -l                 Loop. Run the tests forever\n"
 " -t <tests>         Only run the comma separated list of tests. The test\n"
 "                    names are the same as the ones produced as output.\n"
@@ -619,6 +643,7 @@ int showThroughput(struct aeEventLoop *eventLoop, long long id, void *clientData
         exit(1);
     }
     if (config.csv) return 250;
+    if (config.percentile) return 250;
     if (config.idlemode == 1) {
         printf("clients: %d\r", config.liveclients);
         fflush(stdout);
@@ -672,6 +697,7 @@ int main(int argc, const char **argv) {
     config.loop = 0;
     config.idlemode = 0;
     config.latency = NULL;
+    config.percentile = 0;
     config.clients = listCreate();
     config.hostip = "127.0.0.1";
     config.hostport = 6379;
